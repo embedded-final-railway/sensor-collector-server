@@ -17,27 +17,7 @@ import (
 	"buratud.com/evr-sensor-collector-server/types"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
-
-
-var dbPool *pgxpool.Pool
-var dbClient *mongo.Client
-
-func init() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
-	dbPool, err = pgxpool.New(context.Background(), os.Getenv("DATABASE_CONNECTION_STRING"))
-	if err != nil {
-		log.Fatalf("Unable to create connection pool: %v", err)
-	}
-	dbClient, _ = mongo.Connect(options.Client().ApplyURI(os.Getenv("MONGODB_CONNECTION_STRING")))
-}
 
 var tempDir string
 
@@ -165,7 +145,6 @@ func msgHandler(filePath string) {
 		log.Printf("Error copying data to database: %v", err)
 		return
 	}
-	// log.Printf("Inserted %d records into the database\n", copyCount)
 }
 
 func UploadHandler(c *gin.Context) {
@@ -198,4 +177,41 @@ func UploadHandler(c *gin.Context) {
 	c.Status(http.StatusOK)
 	// log.Printf("Received %d bytes and saved to %s\n", n, filePath) // Print the full path
 }
-
+func GetVibrationStatus(c *gin.Context) {
+	// Get sensor data from last 500 samples first
+	rows, err := dbPool.Query(context.Background(), "SELECT * FROM (SELECT * FROM sensor_data ORDER BY timestamp DESC LIMIT 2500) subquery ORDER BY timestamp ASC")
+	if err != nil {
+		log.Printf("Error querying database: %v", err)
+		c.String(http.StatusInternalServerError, "Error querying database")
+		return
+	}
+	responseData, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (types.SensorData, error) {
+		data := types.SensorData{}
+		err := row.Scan(&data.ID, &data.Timestamp, &data.AccelX, &data.AccelY, &data.AccelZ, &data.Latitude, &data.Longitude)
+		if err != nil {
+			log.Printf("Error scanning row: %v", err)
+			return data, err
+		}
+		return data, nil
+	})
+	if err != nil {
+		log.Printf("Error collecting rows: %v", err)
+		c.String(http.StatusInternalServerError, "Error collecting rows")
+		return
+	}
+	// From these data, check how many point is crossing -1g or 1g from x-axis
+	// If more than 20% of the data is crossing this threshold, we can say that the device is vibrating
+	vibrationCount := 0
+	for _, data := range responseData {
+		if data.AccelX < -5 || data.AccelX > 5 {
+			vibrationCount++
+		}
+	}
+	vibrationStatus := types.VibrationStatus{
+		IsVibrating: false,
+	}
+	if float64(vibrationCount)/float64(len(responseData)) > 0.2 {
+		vibrationStatus.IsVibrating = true
+	}
+	c.JSON(http.StatusOK, vibrationStatus)
+}
